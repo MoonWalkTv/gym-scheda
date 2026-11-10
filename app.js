@@ -1,14 +1,14 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import {
   getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword,
-  updateProfile, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult,
+  updateProfile, GoogleAuthProvider, OAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult,
   sendPasswordResetEmail, signOut
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
   doc, setDoc, deleteDoc, onSnapshot, collection, query, orderBy, limit
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { firebaseConfig } from "./firebase-config.js";
+import { firebaseConfig, appleSignIn } from "./firebase-config.js";
 import { TEMPLATE } from "./template.js";
 
 const $ = id => document.getElementById(id);
@@ -18,7 +18,7 @@ const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2
 const CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
 
 function show(section){
-  for (const id of ["loading", "auth", "app", "editor"]) $(id).hidden = id !== section;
+  for (const id of ["loading", "auth", "app", "editor", "programs"]) $(id).hidden = id !== section;
   $("timer").hidden = section !== "app";
 }
 
@@ -85,24 +85,34 @@ $("authForm").addEventListener("submit", async ev => {
   try {
     if (authMode === "login") await signInWithEmailAndPassword(auth, email, pass);
     else {
+      pendingName = name;
       const cred = await createUserWithEmailAndPassword(auth, email, pass);
       await updateProfile(cred.user, {displayName: name});
-      pendingName = name;
     }
   } catch(e) { authMsg(authError(e)); }
   $("authSubmit").disabled = false;
 });
-$("googleBtn").onclick = async () => {
+$("appleBtn").hidden = !appleSignIn;
+$("appleBtn").onclick = () => providerSignIn("apple");
+$("googleBtn").onclick = () => providerSignIn("google");
+async function providerSignIn(kind){
   authMsg("");
-  const provider = new GoogleAuthProvider();
-  provider.setCustomParameters({prompt: "select_account"});
+  let provider;
+  if (kind === "apple") {
+    provider = new OAuthProvider("apple.com");
+    provider.addScope("email"); provider.addScope("name");
+    provider.setCustomParameters({locale: "it"});
+  } else {
+    provider = new GoogleAuthProvider();
+    provider.setCustomParameters({prompt: "select_account"});
+  }
   try { await signInWithPopup(auth, provider); }
   catch(e) {
     if (e && (e.code === "auth/popup-blocked" || e.code === "auth/operation-not-supported-in-this-environment")) {
       try { await signInWithRedirect(auth, provider); } catch(e2) { authMsg(authError(e2)); }
     } else authMsg(authError(e));
   }
-};
+}
 $("forgotBtn").onclick = async () => {
   const email = $("emailInput").value.trim();
   if (!email) { authMsg("Scrivi la tua email qui sopra, poi premi di nuovo «Password dimenticata?»."); return; }
@@ -115,7 +125,8 @@ getRedirectResult(auth).catch(e => { const m = authError(e); if (m) { show("auth
 let user = null, userRef = null, sessCol = null;
 let unsubUser = null, unsubSess = null;
 let pendingName = "";
-let program = null;                       // {title, warm:[], days:[{id,name,sub,ex:[{id,n,s,note}]}]}
+let programs = [], activeId = null;      // all the sheets of this account, and the one in use
+let program = null;                       // active sheet: {id, title, warm:[], days:[{id,name,sub,ex:[{id,n,s,note}]}]}
 let prog = {done:{}, kg:{}};              // progress of the current workouts
 let updated = 0;
 let sessions = [];
@@ -135,7 +146,7 @@ window.addEventListener("offline", () => setStatus());
 onAuthStateChanged(auth, u => {
   if (unsubUser) { unsubUser(); unsubUser = null; }
   if (unsubSess) { unsubSess(); unsubSess = null; }
-  user = u; loaded = false; program = null; sessions = [];
+  user = u; loaded = false; program = null; programs = []; activeId = null; sessions = [];
   if (!u) { show("auth"); setAuthMode(authMode); return; }
   show("loading");
   userRef = doc(db, "users", u.uid);
@@ -144,18 +155,19 @@ onAuthStateChanged(auth, u => {
   unsubUser = onSnapshot(userRef, {includeMetadataChanges: false}, snap => {
     if (!snap.exists()) {
       if (snap.metadata.fromCache) return;             // wait for the server before creating
-      program = clone(TEMPLATE); prog = {done:{}, kg:{}}; updated = Date.now();
-      setDoc(userRef, {program, prog, updated, name: u.displayName || pendingName || "", createdAt: new Date().toISOString()}).catch(() => {});
+      const p = {...clone(TEMPLATE), id: newId()};
+      programs = [p]; activeId = p.id; program = p; prog = {done:{}, kg:{}}; updated = Date.now();
+      setDoc(userRef, {programs: clone(programs), activeId, prog, updated, name: u.displayName || pendingName || "", createdAt: new Date().toISOString()}).catch(() => {});
       firstRender(); return;
     }
     const r = snap.data();
-    if (!snap.metadata.hasPendingWrites && !dirty && !writing && (r.updated || 0) >= updated) {
-      program = r.program || clone(TEMPLATE);
+    if (!snap.metadata.hasPendingWrites && !dirty && !writing && !progWriting && (r.updated || 0) >= updated) {
+      adoptPrograms(r);
       prog = {done: {...(r.prog?.done || {})}, kg: {...(r.prog?.kg || {})}};
       updated = r.updated || 0;
-      if (loaded && !$("editor").hidden) return;       // don't redraw under the editor
+      if (loaded && $("app").hidden) return;           // don't redraw under the editor or the sheets list
       loaded ? safeRender() : firstRender();
-    } else if (!loaded) { program = r.program || clone(TEMPLATE); firstRender(); }
+    } else if (!loaded) { adoptPrograms(r); firstRender(); }
   }, e => { toast("Impossibile leggere la tua scheda: " + (e.code || "errore")); });
 
   unsubSess = onSnapshot(query(sessCol, orderBy("date", "desc"), limit(300)), qs => {
@@ -163,6 +175,18 @@ onAuthStateChanged(auth, u => {
     if (loaded) renderHistory();
   }, () => {});
 });
+
+function adoptPrograms(r){
+  if (Array.isArray(r.programs) && r.programs.length) programs = clone(r.programs);
+  else if (r.program) programs = [{...clone(r.program), id: r.program.id || "main"}];
+  else programs = [{...clone(TEMPLATE), id: newId()}];
+  activeId = programs.some(p => p.id === r.activeId) ? r.activeId : programs[0].id;
+  program = programs.find(p => p.id === activeId);
+}
+function useProgram(id){
+  activeId = id; program = programs.find(p => p.id === id) || programs[0];
+  current = (program.days[0] || {}).id || null;
+}
 
 function firstRender(){
   loaded = true;
@@ -188,8 +212,10 @@ async function flush(){
 window.addEventListener("pagehide", () => { if (dirty) flush(); });
 
 /* ---------------- workout view ---------------- */
-const key = (d, e, j) => `${d}|${e}|${j}`;
-const wkey = (d, e, j) => `${d}|w:${e}|${j}`;
+// progress keys carry the sheet id, so two sheets never share ticks or weights
+const key = (d, e, j) => `${program.id}|${d}|${e}|${j}`;
+const wkey = (d, e, j) => `${program.id}|${d}|w:${e}|${j}`;
+const dayPrefix = d => `${program.id}|${d}|`;
 function scheme(s){ return s.length && s.every(x => x === s[0]) ? s.length + " × " + s[0] : s.join("-"); }
 function prevKg(d, e, j){ for (let x = j - 1; x >= 0; x--) { const v = prog.kg[key(d, e, x)]; if (v) return v; } return ""; }
 const getDay = () => program.days.find(d => d.id === current);
@@ -208,7 +234,12 @@ function exCard(day, e, i){
   return `<article class="ex${allDone ? " complete" : ""}">
     <div class="exhead"><div class="num">${i + 1}</div><div class="exname"><h3>${esc(e.n)}</h3>
       <div class="meta"><span class="scheme">${esc(scheme(e.s))}</span>${e.note ? `<span>${esc(e.note)}</span>` : ""}</div></div></div>
-    <div class="rows">${rows}</div></article>`;
+    <div class="rows">${rows}</div>
+    <div class="extools">
+      <button data-addset="${esc(e.id)}" aria-label="Aggiungi una serie a ${esc(e.n)}">+ Serie</button>
+      <button data-rmset="${esc(e.id)}" aria-label="Togli l'ultima serie da ${esc(e.n)}" ${e.s.length <= 1 ? "disabled" : ""}>− Serie</button>
+      <button data-rmex="${esc(e.id)}" class="rm">Elimina esercizio</button>
+    </div></article>`;
 }
 function warmCard(day, e){
   const pills = e.s.map((r, j) => {
@@ -221,6 +252,7 @@ function warmCard(day, e){
 
 function render(){
   $("progTitle").textContent = program.title || "La mia scheda";
+  $("progSwitch").textContent = programs.length > 1 ? `Le mie schede (${programs.length}) ▾` : "Le mie schede ▾";
   $("tabs").innerHTML = program.days.map((d, i) =>
     `<button class="tab" role="tab" data-day="${esc(d.id)}" aria-selected="${d.id === current}"><b>${esc(d.name)}</b><small>Giorno ${i + 1}</small></button>`).join("");
   const d = getDay();
@@ -236,12 +268,20 @@ function render(){
   const warmOpen = warmEl ? warmEl.open : !warm.every(e => e.s.every((_, j) => prog.done[wkey(d.id, e.id, j)]));
 
   $("day").innerHTML = `
-    <div class="dayhead"><div><h2>${esc(d.name)}</h2>${d.sub ? `<p>${esc(d.sub)}</p>` : ""}</div><div class="count">${done}/${total} serie</div></div>
+    <div class="dayhead"><div><h2>${esc(d.name)}</h2>${d.sub ? `<p>${esc(d.sub)}</p>` : ""}</div>
+      <div class="dayright"><button class="dayedit" id="dayEdit">Modifica scheda</button><div class="count">${done}/${total} serie</div></div></div>
     <div class="bar"><i style="width:${total ? done / total * 100 : 0}%"></i></div>
     ${warm.length ? `<details class="warm" id="warm-${esc(d.id)}" ${warmOpen ? "open" : ""}>
       <summary><b>Riscaldamento / core</b><span>prima di iniziare</span></summary>
       <div class="list">${warm.map(e => warmCard(d, e)).join("")}</div></details>` : ""}
-    <div class="list">${d.ex.map((e, i) => exCard(d, e, i)).join("") || `<p class="emptyday">Nessun esercizio in questo giorno.</p>`}</div>
+    <div class="list">${d.ex.map((e, i) => exCard(d, e, i)).join("") || `<p class="emptyday">Nessun esercizio in questo giorno: aggiungine uno qui sotto.</p>`}</div>
+    <form class="addex" id="addExForm" autocomplete="off">
+      <div class="edrow">
+        <label class="edin">Nuovo esercizio<input id="newExName" maxlength="60" placeholder="Es. Panca piana"></label>
+        <label class="edin">Serie × rip<input id="newExSch" maxlength="40" value="3x10" placeholder="4x8"></label>
+      </div>
+      <button class="addbtn" type="submit">+ Aggiungi esercizio a ${esc(d.name)}</button>
+    </form>
     <div class="actions">
       <button class="primary" id="saveWorkout">Salva allenamento</button>
       <button class="reset" id="reset">Azzera le spunte di oggi</button>
@@ -256,7 +296,7 @@ function fmtDate(iso){
 function renderHistory(){
   const d = getDay(); const el = $("hist");
   if (!d) { el.innerHTML = ""; return; }
-  const list = sessions.filter(s => s.dayId === d.id).slice(0, 10);
+  const list = sessions.filter(s => s.programId === program.id && s.dayId === d.id).slice(0, 10);
   if (!list.length) {
     el.innerHTML = `<h2>Storico ${esc(d.name)}</h2><p class="empty">Ancora nessun allenamento salvato. Quando finisci, premi «Salva allenamento» e lo ritrovi qui con tutti i pesi.</p>`;
     return;
@@ -291,8 +331,8 @@ async function saveWorkout(){
     return {n: e.n, reps: e.s, kg, done: dn};
   });
   if (!doneSets) { toast("Spunta almeno una serie prima di salvare"); return; }
-  const entry = {dayId: d.id, dayName: d.name, date: new Date().toISOString(), doneSets, totalSets, ex};
-  Object.keys(prog.done).forEach(k => { if (k.startsWith(d.id + "|")) delete prog.done[k]; });
+  const entry = {programId: program.id, programTitle: program.title || "", dayId: d.id, dayName: d.name, date: new Date().toISOString(), doneSets, totalSets, ex};
+  Object.keys(prog.done).forEach(k => { if (k.startsWith(dayPrefix(d.id))) delete prog.done[k]; });
   persist();
   const y = window.scrollY; render(); window.scrollTo(0, y);
   toast("Allenamento salvato nello storico");
@@ -310,11 +350,11 @@ function parseScheme(txt){
 }
 function schemeText(s){ return s.length && s.every(x => x === s[0]) ? s.length + "x" + s[0] : s.join("-"); }
 
-function openEditor(){
-  draft = clone(program);
+function openEditor(pid){
+  draft = clone(programs.find(p => p.id === pid) || program);
   draft.warm = draft.warm || [];
   for (const list of [draft.warm, ...draft.days.map(d => d.ex)]) for (const e of list) e.sch = schemeText(e.s);
-  $("menu").hidden = true; $("menuBtn").setAttribute("aria-expanded", "false");
+  closeMenu();
   show("editor"); renderEditor(); window.scrollTo(0, 0);
 }
 function exEditor(path, e, i, len){
@@ -395,12 +435,12 @@ $("edTemplate").onclick = ev => {
   const b = ev.currentTarget;
   if (!b.classList.contains("arm")) { b.classList.add("arm"); b.textContent = "Tocca ancora: la scheda torna quella di esempio"; setTimeout(() => { b.classList.remove("arm"); b.textContent = "Ricomincia dalla scheda di esempio"; }, 3500); return; }
   b.classList.remove("arm"); b.textContent = "Ricomincia dalla scheda di esempio";
-  draft = clone(TEMPLATE);
+  draft = {...clone(TEMPLATE), id: draft.id, title: draft.title || TEMPLATE.title};
   for (const list of [draft.warm, ...draft.days.map(d => d.ex)]) for (const e of list) e.sch = schemeText(e.s);
   renderEditor(); toast("Scheda di esempio caricata: premi «Salva la scheda» per tenerla");
 };
 $("edSave").onclick = async () => {
-  const out = {title: (draft.title || "").trim() || "La mia scheda", warm: [], days: []};
+  const out = {id: draft.id || newId(), title: (draft.title || "").trim() || "La mia scheda", warm: [], days: []};
   const conv = (e, where) => {
     const n = (e.n || "").trim(); const s = parseScheme(e.sch);
     if (!n && !e.sch) return null;
@@ -417,12 +457,11 @@ $("edSave").onclick = async () => {
       return {id: d.id || newId(), name, sub: (d.sub || "").trim(), ex: d.ex.map(e => conv(e, name)).filter(Boolean)};
     });
   } catch(msg) { toast(String(msg)); return; }
-  $("edSave").disabled = true;
-  program = out; updated = Date.now();
+  const i = programs.findIndex(p => p.id === out.id);
+  if (i >= 0) programs[i] = out; else programs.push(out);
+  if (out.id === activeId) program = out;
   if (!program.days.some(d => d.id === current)) current = program.days[0]?.id || null;
-  try { await setDoc(userRef, {program: clone(out), updated}, {merge: true}); toast("Scheda salvata"); }
-  catch(e) { toast("Non riesco a salvare la scheda: " + (e.code || "errore")); }
-  $("edSave").disabled = false;
+  saveProgram(); toast("Scheda «" + out.title + "» salvata");
   draft = null; show("app"); render(); window.scrollTo(0, 0);
 };
 
@@ -440,7 +479,61 @@ $("menuBtn").onclick = ev => {
   const m = $("menu"); m.hidden = !m.hidden; $("menuBtn").setAttribute("aria-expanded", String(!m.hidden));
 };
 document.addEventListener("click", ev => { if (!ev.target.closest(".menuwrap")) { $("menu").hidden = true; $("menuBtn").setAttribute("aria-expanded", "false"); } });
-$("editBtn").onclick = openEditor;
+$("editBtn").onclick = () => openEditor();
+$("progsBtn").onclick = () => openPrograms();
+$("progSwitch").onclick = () => openPrograms();
+
+/* ---------------- my sheets ---------------- */
+function closeMenu(){ $("menu").hidden = true; $("menuBtn").setAttribute("aria-expanded", "false"); }
+function openPrograms(){ closeMenu(); show("programs"); renderPrograms(); window.scrollTo(0, 0); }
+function renderPrograms(){
+  $("progList").innerHTML = programs.map(p => {
+    const nEx = p.days.reduce((a, d) => a + d.ex.length, 0), active = p.id === activeId;
+    const last = sessions.find(s => s.programId === p.id);
+    return `<article class="pcard${active ? " active" : ""}">
+      <div class="phead"><div class="ptxt"><h3>${esc(p.title || "Scheda")}</h3>
+        <p>${p.days.length} ${p.days.length === 1 ? "giorno" : "giorni"} · ${nEx} esercizi${p.days.length ? " · " + esc(p.days.map(d => d.name).join(" / ")) : ""}</p>
+        ${last ? `<p>Ultimo allenamento: ${esc(fmtDate(last.date))}</p>` : ""}</div>
+        ${active ? `<span class="badge">In uso</span>` : ""}</div>
+      <div class="extools">
+        ${active ? "" : `<button class="use" data-puse="${esc(p.id)}">Usa questa scheda</button>`}
+        <button data-pedit="${esc(p.id)}">Modifica</button>
+        <button data-pdup="${esc(p.id)}">Duplica</button>
+        ${programs.length > 1 ? `<button class="rm" data-pdel="${esc(p.id)}">Elimina</button>` : ""}
+      </div></article>`;
+  }).join("");
+}
+$("programs").addEventListener("click", ev => {
+  const b = ev.target.closest("button"); if (!b) return;
+  const id = b.dataset.puse || b.dataset.pedit || b.dataset.pdup || b.dataset.pdel;
+  if (b.dataset.puse) {
+    useProgram(id); saveProgram();
+    show("app"); render(); window.scrollTo(0, 0);
+    toast("Ora usi «" + (program.title || "Scheda") + "»");
+  } else if (b.dataset.pedit) openEditor(id);
+  else if (b.dataset.pdup) {
+    const src = programs.find(p => p.id === id); if (!src) return;
+    const copy = {...clone(src), id: newId(), title: ((src.title || "Scheda") + " (copia)").slice(0, 30)};
+    programs.splice(programs.indexOf(src) + 1, 0, copy);
+    saveProgram(); renderPrograms(); toast("Scheda duplicata");
+  } else if (b.dataset.pdel) {
+    if (!twoTap(b, "Elimina", "Tocca ancora")) return;
+    programs = programs.filter(p => p.id !== id);
+    for (const m of [prog.done, prog.kg]) Object.keys(m).forEach(k => { if (k.startsWith(id + "|")) delete m[k]; });
+    if (id === activeId) useProgram(programs[0].id);
+    saveProgram(); renderPrograms(); toast("Scheda eliminata");
+  } else if (b.id === "progBack") { show("app"); render(); window.scrollTo(0, 0); }
+  else if (b.id === "newEmpty" || b.id === "newTemplate") {
+    const name = $("newProgName").value.trim();
+    const p = b.id === "newEmpty"
+      ? {id: newId(), title: name || "Nuova scheda", warm: [], days: [{id: newId(), name: "Giorno 1", sub: "", ex: []}]}
+      : {...clone(TEMPLATE), id: newId(), title: name || TEMPLATE.title};
+    programs.push(p); useProgram(p.id); saveProgram();
+    $("newProgName").value = "";
+    toast("Scheda «" + p.title + "» creata");
+    if (b.id === "newEmpty") openEditor(p.id); else { show("app"); render(); window.scrollTo(0, 0); }
+  }
+});
 $("logoutBtn").onclick = async () => { if (dirty) await flush(); stopTimer(); signOut(auth); };
 
 $("app").addEventListener("click", ev => {
@@ -459,10 +552,30 @@ $("app").addEventListener("click", ev => {
     return;
   }
   if (ev.target.closest("#saveWorkout")) { saveWorkout(); return; }
+  if (ev.target.closest("#dayEdit")) { openEditor(); return; }
+  const addSet = ev.target.closest("[data-addset]"), rmSet = ev.target.closest("[data-rmset]"), rmEx = ev.target.closest("[data-rmex]");
+  if (addSet || rmSet || rmEx) {
+    const d = getDay(), id = (addSet || rmSet || rmEx).dataset[addSet ? "addset" : rmSet ? "rmset" : "rmex"];
+    const e = d && d.ex.find(x => x.id === id); if (!e) return;
+    if (addSet) { if (e.s.length >= 12) { toast("Massimo 12 serie"); return; } e.s.push(e.s[e.s.length - 1] || "10"); }
+    else if (rmSet) {
+      if (e.s.length <= 1) return;
+      const j = e.s.length - 1; e.s.pop();
+      delete prog.done[key(d.id, e.id, j)]; delete prog.kg[key(d.id, e.id, j)];
+    } else {
+      if (!twoTap(rmEx, "Elimina esercizio", "Tocca ancora per eliminare")) return;
+      d.ex = d.ex.filter(x => x.id !== id);
+      Object.keys(prog.done).forEach(k => { if (k.startsWith(`${dayPrefix(d.id)}${id}|`)) delete prog.done[k]; });
+      toast("Esercizio eliminato");
+    }
+    saveProgram();
+    const y = window.scrollY; render(); window.scrollTo(0, y);
+    return;
+  }
   const reset = ev.target.closest("#reset");
   if (reset) {
     if (!twoTap(reset, "Azzera le spunte di oggi", "Tocca ancora per azzerare")) return;
-    Object.keys(prog.done).forEach(k => { if (k.startsWith(current + "|")) delete prog.done[k]; });
+    Object.keys(prog.done).forEach(k => { if (k.startsWith(dayPrefix(current))) delete prog.done[k]; });
     persist(); render(); return;
   }
   const del = ev.target.closest("[data-del]");
@@ -485,6 +598,30 @@ $("app").addEventListener("input", ev => {
   }
   persist();
 });
+
+$("app").addEventListener("submit", ev => {
+  if (ev.target.id !== "addExForm") return;
+  ev.preventDefault();
+  const d = getDay(); if (!d) return;
+  const n = $("newExName").value.trim(), s = parseScheme($("newExSch").value);
+  if (!n) { toast("Scrivi il nome dell'esercizio"); $("newExName").focus(); return; }
+  if (!s.length) { toast("Scrivi serie e ripetizioni, es. 4x8"); $("newExSch").focus(); return; }
+  d.ex.push({id: newId(), n, s});
+  saveProgram();
+  const y = window.scrollY; render(); window.scrollTo(0, y);
+  toast("«" + n + "» aggiunto a " + d.name);
+});
+
+let progWriting = false, progAgain = false;
+async function saveProgram(){
+  updated = Date.now();
+  if (progWriting) { progAgain = true; return; }
+  progWriting = true; setStatus("busy");
+  try { await setDoc(userRef, {programs: clone(programs), activeId, prog: clone(prog), updated}, {merge: true}); }
+  catch(e) { toast("Non riesco a salvare la scheda: " + (e.code || "errore")); }
+  progWriting = false;
+  if (progAgain) { progAgain = false; saveProgram(); } else setStatus();
+}
 
 /* ---------------- rest timer ---------------- */
 const timerEl = $("timer"), clockEl = $("clock");
